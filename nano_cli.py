@@ -517,5 +517,8 @@ for step in range(args.num_iterations):
         break
 
 if master_process:
-    peak = torch.cuda.max_memory_allocated() // 1024 // 1024
-    print(f"peak memory consumption: {peak} MiB", flush=True)
+    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+# -------------------------------------------------------------------------
+# clean up nice
+dist.destroy_process_group()
