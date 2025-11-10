@@ -18,7 +18,7 @@ Refactor highlights:
 Usage examples (8 GPUs):
 
 torchrun --standalone --nproc_per_node=8 nano_cli.py \
-  --num-devices 8 --batch-size 256 --num-iterations 5100 \
+  --num-devices 8 --batch-size 512 --num-iterations 5100 \
   --scheduler cosine --warmup-steps 500 --min-lr 0.0 \
   --opt1 AdamW \
   --opt1-kwargs lr=0.0036,betas=[0.9,0.95],eps=1e-8,weight_decay=0.0 \
@@ -26,16 +26,22 @@ torchrun --standalone --nproc_per_node=8 nano_cli.py \
   --opt2-kwargs lr=0.02,momentum=0.95,nesterov=true,backend=newtonschulz5,backend_steps=5
 
 torchrun --standalone --nproc_per_node=8 nano_cli.py \
-  --num-devices 8 --batch-size 256 --num-iterations 5100 \
-  --scheduler cosine --warmup-steps 500 --min-lr 0.0 \
+  --num-devices 8 --batch-size 512 --num-iterations 5100 \
+  --scheduler cosine --warmup-steps 250 --min-lr 0.0 \
   --opt1 AdamW \
-  --opt1-kwargs '{"lr":0.0036,"betas":[0.9,0.95],"eps":1e-8,"weight_decay":0.0}' \
-  --opt2 Muon \
-  --opt2-kwargs "{\"lr\":0.02,\"momentum\":0.95,\"nesterov\":true,\"backend\":\"newtonschulz5\",\"backend_steps\":5}"
+  --opt1-kwargs lr=0.0036,betas=[0.9,0.95],eps=1e-8,weight_decay=0.0 \
+  --opt2 MuonIterAvg \
+  --opt2-kwargs lr=0.02,momentum=0.95,nesterov=true,backend=newtonschulz5,backend_steps=5,ia_beta=0.99
 
+Schedule‑Free example (opt1 and opt2 warmup→constant internally):
 
-Schedule‑Free example (opt2 warmup→constant internally; opt1 uses external cosine):
-  --opt2 AdamWScheduleFree --opt2-kwargs '{"lr":0.0036,"betas":[0.9,0.999],"eps":1e-8}'
+torchrun --standalone --nproc_per_node=8 nano_cli.py \
+  --num-devices 8 --batch-size 512 --num-iterations 5100 \
+  --scheduler cosine --warmup-steps 250 --min-lr 0.0 \
+  --opt1 AdamWScheduleFree \
+  --opt1-kwargs lr=0.0036,betas=[0.9,0.99],eps=1e-8 \
+  --opt2 AdamWScheduleFree \
+  --opt2-kwargs lr=0.0036,betas=[0.9,0.99],eps=1e-8
 
 This file assumes the following utilities are available (as in your original project):
   from utils import DistributedDataLoader, GPT, GPTConfig
@@ -51,6 +57,7 @@ import time
 import math
 import uuid
 import argparse
+import subprocess, textwrap
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -64,7 +71,8 @@ from torch.optim.lr_scheduler import LambdaLR
 # Expect these to be present in the repo
 from data_loader import DistributedDataLoader
 from gpt2_model import GPT, GPTConfig
-from optimizers import Muon
+from optimizers import Muon, MuonIterAvg
+from adamw_schedulefree import AdamWScheduleFree
 
 # ----------------------------------------------------------------------------
 # CLI & defaults
@@ -237,22 +245,15 @@ def make_cosine_with_warmup_lambda(total_steps: int, warmup: int, min_lr_ratio: 
         return min_lr_ratio + (1 - min_lr_ratio) * cos
     return lr_mult
 
-
 def _optimizers_eval(optimizers: List[torch.optim.Optimizer]):
     for _opt in optimizers:
         if hasattr(_opt, "eval") and callable(_opt.eval):
             _opt.eval()
 
-
 def _optimizers_train(optimizers: List[torch.optim.Optimizer]):
     for _opt in optimizers:
         if hasattr(_opt, "train") and callable(_opt.train):
             _opt.train()
-
-
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
 
 # --- Parse args & seed ---------------------------------------------------
 parser = build_argparser()
@@ -281,15 +282,16 @@ opt2_kwargs = _safe_parse_kwargs(getattr(args, "opt2_kwargs", ""))
 opt1_kwargs = _maybe_fill_dist(args.opt1, opt1_kwargs)
 opt2_kwargs = _maybe_fill_dist(args.opt2, opt2_kwargs)
 
-print("=== RUN CONFIG (repro header) ===")
-print(f"world_size={ddp_world_size} devices={getattr(args,'num_devices',1)}")
-print(f"batch_size={args.batch_size} seq_len={args.sequence_len} tokens_per_step={tokens_per_step()}")
-print(f"num_iterations={args.num_iterations} val_loss_every={args.val_loss_every} val_tokens={args.val_tokens}")
-print(f"save_every={args.save_every} first_below={args.first_below}")
-print(f"scheduler={args.scheduler} warmup_steps={args.warmup_steps} min_lr={args.min_lr}")
-print(f"opt1={args.opt1} opt1_kwargs={opt1_kwargs}")
-print(f"opt2={args.opt2} opt2_kwargs={opt2_kwargs}")
-print("=================================")
+if master_process:
+    print("=== RUN CONFIG (repro header) ===")
+    print(f"world_size={ddp_world_size} devices={getattr(args,'num_devices',1)}")
+    print(f"batch_size={args.batch_size} seq_len={args.sequence_len} tokens_per_step={tokens_per_step()}")
+    print(f"num_iterations={args.num_iterations} val_loss_every={args.val_loss_every} val_tokens={args.val_tokens}")
+    print(f"save_every={args.save_every} first_below={args.first_below}")
+    print(f"scheduler={args.scheduler} warmup_steps={args.warmup_steps} min_lr={args.min_lr}")
+    print(f"opt1={args.opt1} opt1_kwargs={opt1_kwargs}")
+    print(f"opt2={args.opt2} opt2_kwargs={opt2_kwargs}")
+    print("=================================")
 
 # --- Build model ---------------------------------------------------------
 gptconf = GPTConfig(
@@ -299,13 +301,13 @@ gptconf = GPTConfig(
     n_embd=args.n_embd,
 )
 
-print("[init] building/compiling model...", flush=True)
+# print("[init] building/compiling model...", flush=True)
 _m = GPT(gptconf).cuda()
 _m = torch.compile(_m)            # like your original
 model = DDP(_m, device_ids=[ddp_local_rank])
 raw_model = model.module          # unwrapped
 ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-print("[init] model ready", flush=True)
+# print("[init] model ready", flush=True)
 
 # --- Data ---------------------------------------------------------------
 B, T = args.device_batch_size, args.sequence_len
@@ -314,7 +316,7 @@ val_steps = args.val_tokens // (B * T * ddp_world_size)
 assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
-print("[init] building dataloaders...", flush=True)
+# print("[init] building dataloaders...", flush=True)
 train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
 val_loader   = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 if master_process:
@@ -350,8 +352,11 @@ if master_process:
 opt1_is_sf = _is_schedule_free_name(args.opt1)
 opt2_is_sf = _is_schedule_free_name(args.opt2)
 
-if opt1_is_sf: opt1_kwargs.setdefault("warmup_steps", args.warmup_steps)
-if opt2_is_sf: opt2_kwargs.setdefault("warmup_steps", args.warmup_steps)
+# Force schedule-free optimizers to have *no internal warmup*
+if opt1_is_sf:
+    opt1_kwargs.pop("warmup_steps", None)
+if opt2_is_sf:
+    opt2_kwargs.pop("warmup_steps", None)
 
 optimizer1 = build_optimizer(args.opt1, params_opt1, opt1_kwargs)
 optimizer2 = build_optimizer(args.opt2, params_opt2, opt2_kwargs)
@@ -362,159 +367,266 @@ _optimizers_train(optimizers)
 
 if (opt1_is_sf or opt2_is_sf) and master_process:
     print("[info] Schedule-Free optimizer detected:", flush=True)
-    if opt1_is_sf: print(f"  - opt1={args.opt1}: internal warmup={args.warmup_steps}", flush=True)
-    if opt2_is_sf: print(f"  - opt2={args.opt2}: internal warmup={args.warmup_steps}", flush=True)
+    if opt1_is_sf: print(f"  - opt1={args.opt1}: linear warmup={args.warmup_steps}", flush=True)
+    if opt2_is_sf: print(f"  - opt2={args.opt2}: linear warmup={args.warmup_steps}", flush=True)
     if args.scheduler != "none":
         print("[info] External cosine applies ONLY to non-SF opts.", flush=True)
 
-# --- LR schedulers (cosine warmup->decay) --------------------------------
-from torch.optim.lr_scheduler import LambdaLR
-
 def _ratio_for_opt(opt: torch.optim.Optimizer) -> float:
-    if args.min_lr <= 0: return 0.0
-    base_lrs = [g.get("initial_lr", g["lr"]) for g in opt.param_groups]
+    # r = min_lr / base_lr over param groups; clamp to [0,1]
+    if args.min_lr is None:
+        return 0.0
+    base_lrs = [pg.get("initial_lr", pg["lr"]) for pg in opt.param_groups]
     blr_max = max(base_lrs) if base_lrs else 1.0
-    return min(1.0, float(args.min_lr) / max(1e-12, blr_max))
+    return float(max(0.0, min(1.0, args.min_lr / max(1e-12, blr_max))))
 
-def make_cosine_with_warmup_lambda(total_steps: int, warmup: int, min_lr_ratio: float):
-    warm = max(0, min(warmup, max(0, total_steps - 1)))
-    def lr_mult(step: int):
-        if step < warm:  # linear warmup
-            return (step + 1) / float(max(1, warm))
-        decay_steps = max(1, total_steps - warm)
-        pct = min(1.0, max(0.0, (step - warm) / decay_steps))
-        import math
-        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * pct))
-    return lr_mult
+def make_linear_warmup_lambda(total_steps: int, warmup_steps: int):
+    warmup_steps = max(0, int(warmup_steps))
+    if warmup_steps == 0:
+        return lambda s: 1.0
+    denom = float(warmup_steps)
+    return lambda s: min(1.0, max(0.0, (min(s, warmup_steps - 1) + 1) / denom))
+
+def make_cosine_lambda(total_steps: int, r: float):
+    # cosine from 1.0 down to r over [0, total_steps)
+    T = max(1, int(total_steps))
+    return lambda s: r + 0.5 * (1 - r) * (1 + math.cos(math.pi * min(s, T - 1) / (T - 1)))
 
 schedulers: List[LambdaLR] = []
-if args.scheduler == "cosine":
-    if not opt1_is_sf:
-        schedulers.append(LambdaLR(optimizer1, lr_lambda=make_cosine_with_warmup_lambda(
-            args.num_iterations, args.warmup_steps, _ratio_for_opt(optimizer1))))
-    if not opt2_is_sf:
-        schedulers.append(LambdaLR(optimizer2, lr_lambda=make_cosine_with_warmup_lambda(
-            args.num_iterations, args.warmup_steps, _ratio_for_opt(optimizer2))))
-else:
-    if not opt1_is_sf: schedulers.append(LambdaLR(optimizer1, lr_lambda=lambda _: 1.0))
-    if not opt2_is_sf: schedulers.append(LambdaLR(optimizer2, lr_lambda=lambda _: 1.0))
 
+warm = make_linear_warmup_lambda(args.num_iterations, args.warmup_steps)
+
+def _final_lambda_for(opt, is_sf: bool):
+    if is_sf or args.scheduler != "cosine":
+        # Schedule-free (or no cosine requested): warmup only, then constant
+        return warm
+    # Non-SF + cosine: warmup × cosine
+    r = _ratio_for_opt(opt)
+    cos = make_cosine_lambda(args.num_iterations, r)
+    return lambda s, w=warm, c=cos: w(s) * c(s)
+
+if optimizer1 is not None:
+    lam1 = _final_lambda_for(optimizer1, opt1_is_sf)
+    schedulers.append(LambdaLR(optimizer1, lr_lambda=lam1, last_epoch=-1))
+
+if optimizer2 is not None:
+    lam2 = _final_lambda_for(optimizer2, opt2_is_sf)
+    schedulers.append(LambdaLR(optimizer2, lr_lambda=lam2, last_epoch=-1))
+
+#####################################################################################
+# --- Logging setup (classic header, consolidated to "begin logging") ---------
+def _run_config_text():
+    lines = []
+    lines.append("=== RUN CONFIG (repro header) ===")
+    lines.append(f"date={time.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"world_size={ddp_world_size} local_rank={ddp_local_rank} device={device}")
+    lines.append(f"num_devices={getattr(args,'num_devices', ddp_world_size)}")
+    lines.append(f"batch_size={args.batch_size} device_batch_size={args.device_batch_size} seq_len={args.sequence_len}")
+    lines.append(f"num_iterations={args.num_iterations} val_loss_every={args.val_loss_every} val_tokens={args.val_tokens}")
+    lines.append(f"scheduler={args.scheduler} warmup_steps={args.warmup_steps} min_lr={args.min_lr}")
+    lines.append(f"opt1={args.opt1} opt1_kwargs={opt1_kwargs}")
+    lines.append(f"opt2={args.opt2} opt2_kwargs={opt2_kwargs}")
+    lines.append(f"param_group_opt1_count={len(params_opt1)} param_group_opt1_params={_count_params(params_opt1):,}")
+    lines.append(f"param_group_opt2_count={len(params_opt2)} param_group_opt2_params={_count_params(params_opt2):,}")
+    lines.append("=================================")
+    return "\n".join(lines)
+
+def _env_block_text():
+    try:
+        smi = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        smi_out = smi.stdout
+    except Exception as e:
+        smi_out = f"(nvidia-smi unavailable: {e})"
+    torch_ver = getattr(torch, "__version__", "unknown")
+    cuda_ver  = getattr(torch.version, "cuda", "unknown")
+    return textwrap.dedent(f"""\
+        === ENVIRONMENT =====================================
+        torch={torch_ver}  cuda={cuda_ver}
+        nvidia-smi:
+        {smi_out}
+        ======================================================
+    """)
+
+def _source_text():
+    try:
+        with open(sys.argv[0], "r") as f:
+            return f.read()
+    except Exception as e:
+        return f"(could not read source file: {e})"
+
+def _format_lr(opt: Optional[torch.optim.Optimizer], label: str) -> str:
+    if opt is None:
+        return f"{label}=None"
+    lrs = [pg.get("lr") for pg in opt.param_groups if "lr" in pg]
+    if not lrs:
+        return f"{label}=[]"
+    uniq = sorted({float(x) for x in lrs})
+    if len(uniq) == 1:
+        return f"{label}={uniq[0]:.8f}"
+    return f"{label}=[" + ", ".join(f"{x:.8f}" for x in lrs) + "]"
+    
+# ============================== begin logging ================================
 if master_process:
+    run_id = str(uuid.uuid4())
+    logdir = f'logs/{run_id}/'
+    os.makedirs(logdir, exist_ok=True)
+    logfile = f'logs/{run_id}.txt'
+
+    print("=== SCHEDULER PLAN ===", flush=True)
+    def _plan_line(tag: str, opt, is_sf: bool):
+        if opt is None:
+            return f"  - {tag}=None"
+        if is_sf:
+            return f"  - {tag} (Schedule-Free): external linear warmup={args.warmup_steps} → constant"
+        else:
+            r = _ratio_for_opt(opt)
+            return f"  - {tag}: external linear warmup={args.warmup_steps} → cosine to r={r:.4f}"
+    print(_plan_line("opt1", optimizer1, opt1_is_sf), flush=True)
+    print(_plan_line("opt2", optimizer2, opt2_is_sf), flush=True)
+
+    # Preview the exact multipliers using the same lambdas the schedulers use
+    preview = [
+        0,
+        max(0, args.warmup_steps // 2),
+        max(0, args.warmup_steps - 1),
+        args.warmup_steps,
+        args.num_iterations // 2,
+        max(0, args.num_iterations - 1),
+    ]
     print("=== LR MULTIPLIER PREVIEW ===", flush=True)
-    preview = [0, max(0, args.warmup_steps//2), max(0, args.warmup_steps-1),
-               args.warmup_steps, args.num_iterations//2, max(0, args.num_iterations-1)]
-    def _mult_for(opt_is_sf: bool, opt: Optional[torch.optim.Optimizer], s: int) -> float:
-        if args.scheduler != "cosine" or opt_is_sf or opt is None: return 1.0
-        r = _ratio_for_opt(opt); return make_cosine_with_warmup_lambda(args.num_iterations, args.warmup_steps, r)(s)
     for s in preview:
-        s = max(0, min(s, args.num_iterations-1))
-        print(f"step={s} opt1_mult={_mult_for(opt1_is_sf, optimizer1, s):.6f} "
-              f"opt2_mult={_mult_for(opt2_is_sf, optimizer2, s):.6f}", flush=True)
+        s = max(0, min(int(s), int(args.num_iterations) - 1))
+        m1 = lam1(s) if optimizer1 is not None else float("nan")
+        m2 = lam2(s) if optimizer2 is not None else float("nan")
+        print(f"step={s} opt1_mult={m1:.6f} opt2_mult={m2:.6f}", flush=True)
     print("================================", flush=True)
 
-# --- Logging setup -------------------------------------------------------
-out_dir = os.path.join("logs", time.strftime("%Y%m%d-%H%M%S"))
-if master_process: os.makedirs(out_dir, exist_ok=True)
-logfile = os.path.join(out_dir, "train.log")
+    # Capture full source for reproducibility
+    code = _source_text()
 
-def _lr_string(opt: torch.optim.Optimizer) -> str:
-    lrs = []
-    for g in opt.param_groups:
-        lr = g.get("scheduled_lr", g["lr"])
-        lrs.append(f"{lr:.6g}")
-    return "[" + ",".join(lrs) + "]"
+    # Single, consolidated header write to logfile
+    with open(logfile, "w") as f:
+        f.write("=" * 100 + "\n")
+        f.write(_run_config_text() + "\n")
+        f.write("=" * 100 + "\n")
+        f.write(_env_block_text() + "\n")
+        f.write("=" * 100 + "\n")
+        f.write(code + "\n")
+        f.write("=" * 100 + "\n")
 
-# --- Training loop (old style; no scaler) --------------------------------
-print("[run] starting loop...", flush=True)
+    # Mirror essentials to console
+    print(_run_config_text(), flush=True)
+# ============================ end begin logging ==============================
+        
+training_time_ms = 0
+# start the clock
+torch.cuda.synchronize()
 t0 = time.time()
-training_time_ms = 0.0
-timed_steps = 0
-best_ckpt_written = False
+# begin training
+train_loader.reset()
+for step in range(args.num_iterations + 1):
+    last_step = (step == args.num_iterations)
+    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+    # steps with dummy data first, and then re-initialize the model and reset the loader.
+    if step == 10:
+        training_time_ms = 0
+        t0 = time.time()
+    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-for step in range(args.num_iterations):
-    last_step = (step == args.num_iterations - 1)
-
-    # === Validation =========================================================
-    do_val = (args.val_loss_every > 0 and (step % args.val_loss_every == 0)) or last_step
-    if do_val:
+    # once in a while evaluate the validation dataset
+    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        # stop the clock
         torch.cuda.synchronize()
-        training_time_ms += 1000.0 * (time.time() - t0)
-
-        _optimizers_eval(optimizers)  # only change vs original
-
+        training_time_ms += 1000 * (time.time() - t0)
+        # run validation batches
+        _optimizers_eval(optimizers)  # switch optimizer to evaluation mode
+        
         model.eval()
         val_loader.reset()
-        val_loss = torch.zeros((), device=x.device)
+        val_loss = 0.0
         for _ in range(val_steps):
-            x_val, y_val = val_loader.next_batch()  # keep old semantics (no .to(device))
-            with ctx:                               # no torch.no_grad() to avoid compile quirk
+            x_val, y_val = val_loader.next_batch()
+            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
                 _, loss = model(x_val, y_val, return_logits=False)
-            val_loss += loss.detach()
-            del loss
+                val_loss += loss.detach()
+                del loss
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
-
+        # log val loss to console and to logfile
         if master_process:
-            print(f"VAL step:{step}/{args.num_iterations} val_loss:{val_loss:.4f}", flush=True)
+            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
-                f.write(f"VAL step:{step}/{args.num_iterations} val_loss:{val_loss:.4f}\n")
-
-        # back to train
+                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+        # start the clock again
+        torch.cuda.synchronize()
+        
+        # switch optimizers back to train
         model.train()
         _optimizers_train(optimizers)
+        
+        t0 = time.time()
 
-        t0 = time.time()  # restart timer
+    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # save the state of the training process
+        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
 
-    # === Train ==============================================================
+    # bit confusing: we want to make sure to eval on 0th iteration
+    # but also after the very last iteration. so we loop for step <= num_iterations
+    # instead of just < num_iterations (one extra due to <=), only to do
+    # the validation/sampling one last time, and then we break right here as we're done.
+    if last_step:
+        break
+
+    # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
-    for i in range(1, train_accumulation_steps + 1):
+    for i in range(1, train_accumulation_steps+1):
+        # forward pass
         with ctx:
             _, loss = model(x, y, return_logits=False)
             train_loss = loss.detach()
-
-        # next batch (match old code: do not .to(device); loader hands CUDA tensors)
+        # advance the dataset for the next batch
         x, y = train_loader.next_batch()
-
+        # backward pass
         if i < train_accumulation_steps:
-            with model.no_sync():
+            with model.no_sync(): # there's no need to sync gradients every accumulation step
                 loss.backward()
         else:
-            loss.backward()
-
-    # average grads
+            loss.backward() # just sync on the last step
     for p in model.parameters():
-        if p.grad is not None:
-            p.grad /= train_accumulation_steps
-
-    # step opts, then scheds; zero grads like before
-    for opt in optimizers:
+        p.grad /= train_accumulation_steps
+    # step the optimizers and schedulers
+    for opt, sched in zip(optimizers, schedulers):
         opt.step()
+        sched.step()
+    # null the gradients
     model.zero_grad(set_to_none=True)
+    # --------------- TRAINING SECTION END -------------------
+    # everything that follows now is just diagnostics, prints, logging, etc.
 
-    for g in optimizer1.param_groups: g["scheduled_lr"] = g["lr"]
-    for g in optimizer2.param_groups: g["scheduled_lr"] = g["lr"]
-    for sch in schedulers: sch.step()
-
-    timed_steps += 1
-
+    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
-        approx = training_time_ms + 1000.0 * (time.time() - t0)
+        approx_time = training_time_ms + 1000 * (time.time() - t0)
         print(
-            f"step:{step+1}/{args.num_iterations} "
-            f"train_loss:{float(train_loss):.4f} "
-            f"lr1:{_lr_string(optimizer1)} lr2:{_lr_string(optimizer2)} "
-            f"train_time:{approx:.0f}ms step_avg:{approx/max(1,timed_steps):.2f}ms",
-            flush=True
-        )
+    f"step:{step+1}/{args.num_iterations} "
+    f"{_format_lr(optimizer1, 'opt1_lr')} {_format_lr(optimizer2, 'opt2_lr')} "
+    f"train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms "
+    f"step_avg:{approx_time/timed_steps:.2f}ms",
+    flush=True)
         with open(logfile, "a") as f:
             f.write(
-                f"step:{step+1}/{args.num_iterations} train_loss:{float(train_loss):.4f} "
-                f"lr1:{_lr_string(optimizer1)} lr2:{_lr_string(optimizer2)} "
-                f"train_time:{approx:.0f}ms step_avg:{approx/max(1,timed_steps):.2f}ms\n"
+                f"step:{step+1}/{args.num_iterations} "
+                f"{_format_lr(optimizer1, 'opt1_lr')} {_format_lr(optimizer2, 'opt2_lr')} "
+                f"train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms "
+                f"step_avg:{approx_time/timed_steps:.2f}ms\n"
             )
-
-    if last_step:
-        break
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
