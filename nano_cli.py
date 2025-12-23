@@ -73,6 +73,9 @@ from data_loader import DistributedDataLoader
 from gpt2_model import GPT, GPTConfig
 from optimizers import Muon, MuonIterAvg
 from adamw_schedulefree import AdamWScheduleFree
+from muon_schedulefree import MuonScheduleFree
+from normuon_schedulefree import NorMuonScheduleFree
+from asgo import asgo
 
 # ----------------------------------------------------------------------------
 # CLI & defaults
@@ -80,8 +83,8 @@ from adamw_schedulefree import AdamWScheduleFree
 @dataclass
 class Hyperparameters:
     # data/model
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = 'data/fineweb100B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb100B/fineweb_val_*.bin' # input .bin to eval validation loss on
     model_type: str = "gpt2"
     vocab_size: int = 50304  # Modified to fit the GPU bette r
     # Parameters for GPT 2 Small 
@@ -233,7 +236,6 @@ def build_optimizer(name: str, params: Iterable[torch.nn.Parameter], kw: Dict[st
         g.setdefault("initial_lr", g["lr"])
     return opt
 
-
 def make_cosine_with_warmup_lambda(total_steps: int, warmup: int, min_lr_ratio: float):
     warm = max(0, min(warmup, max(0, total_steps - 1)))
     def lr_mult(step: int):
@@ -353,10 +355,17 @@ opt1_is_sf = _is_schedule_free_name(args.opt1)
 opt2_is_sf = _is_schedule_free_name(args.opt2)
 
 # Force schedule-free optimizers to have *no internal warmup*
-if opt1_is_sf:
-    opt1_kwargs.pop("warmup_steps", None)
-if opt2_is_sf:
-    opt2_kwargs.pop("warmup_steps", None)
+# if opt1_is_sf:
+#     opt1_kwargs.pop("warmup_steps", None)
+# if opt2_is_sf:
+#     opt2_kwargs.pop("warmup_steps", None)
+
+# Schedule-free optimizers should handle warmup internally.
+# If user didn't explicitly set warmup_steps in --opt*-kwargs, default to CLI --warmup-steps.
+if opt1_is_sf and "warmup_steps" not in opt1_kwargs:
+    opt1_kwargs["warmup_steps"] = int(args.warmup_steps)
+if opt2_is_sf and "warmup_steps" not in opt2_kwargs:
+    opt2_kwargs["warmup_steps"] = int(args.warmup_steps)
 
 optimizer1 = build_optimizer(args.opt1, params_opt1, opt1_kwargs)
 optimizer2 = build_optimizer(args.opt2, params_opt2, opt2_kwargs)
@@ -396,14 +405,25 @@ schedulers: List[LambdaLR] = []
 
 warm = make_linear_warmup_lambda(args.num_iterations, args.warmup_steps)
 
+# def _final_lambda_for(opt, is_sf: bool):
+#     if is_sf or args.scheduler != "cosine":
+#         # Schedule-free (or no cosine): warmup only, then constant
+#         return warm
+#     # Non-SF + cosine: linear warmup → cosine
+#     r = _ratio_for_opt(opt)  # = min_lr / base_lr
+#     return make_cosine_with_warmup_lambda(args.num_iterations, args.warmup_steps, r)
 def _final_lambda_for(opt, is_sf: bool):
-    if is_sf or args.scheduler != "cosine":
-        # Schedule-free (or no cosine requested): warmup only, then constant
+    if is_sf:
+        # Schedule-free: NO external scheduling (optimizer handles warmup/constant internally).
+        return (lambda s: 1.0)
+    if args.scheduler != "cosine":
+        # Non-SF, no cosine: warmup only, then constant
         return warm
-    # Non-SF + cosine: warmup × cosine
-    r = _ratio_for_opt(opt)
-    cos = make_cosine_lambda(args.num_iterations, r)
-    return lambda s, w=warm, c=cos: w(s) * c(s)
+    # Non-SF + cosine: linear warmup → cosine
+    r = _ratio_for_opt(opt)  # = min_lr / base_lr
+    return make_cosine_with_warmup_lambda(args.num_iterations, args.warmup_steps, r)
+
+
 
 if optimizer1 is not None:
     lam1 = _final_lambda_for(optimizer1, opt1_is_sf)
@@ -457,13 +477,45 @@ def _source_text():
 def _format_lr(opt: Optional[torch.optim.Optimizer], label: str) -> str:
     if opt is None:
         return f"{label}=None"
-    lrs = [pg.get("lr") for pg in opt.param_groups if "lr" in pg]
+    # lrs = [pg.get("lr") for pg in opt.param_groups if "lr" in pg]
+    lrs = [pg.get("scheduled_lr", pg.get("lr")) for pg in opt.param_groups if "lr" in pg]
+
     if not lrs:
         return f"{label}=[]"
     uniq = sorted({float(x) for x in lrs})
     if len(uniq) == 1:
         return f"{label}={uniq[0]:.8f}"
     return f"{label}=[" + ", ".join(f"{x:.8f}" for x in lrs) + "]"
+
+def _format_sf_extra(opt: Optional[torch.optim.Optimizer], label: str) -> str:
+    if opt is None:
+        return ""
+    pg = opt.param_groups[0]
+    if not all(k in pg for k in ("k", "weight_sum", "lr_max", "r", "weight_lr_power")):
+        return ""
+
+    k = float(pg["k"])                      # after step(), k has been incremented
+    weight_sum = float(pg["weight_sum"])
+    lr_max = float(pg["lr_max"])
+    r = float(pg["r"])
+    wlp = float(pg["weight_lr_power"])
+
+    if weight_sum <= 0:
+        return ""
+    weight = (k ** r) * (lr_max ** wlp)
+    ckp1 = weight / weight_sum
+
+    lr_eff = float(pg.get("scheduled_lr", pg["lr"]))
+    if "momentum" in pg:
+        beta = float(pg["momentum"])
+    elif "betas" in pg:
+        beta = float(pg["betas"][0])
+    else:
+        return f"{label}_ckp1={ckp1:.6g}"
+
+    y_coef = lr_eff * (beta * (1.0 - ckp1) - 1.0)
+    return f"{label}_ckp1={ckp1:.6g} {label}_ycoef={y_coef:.6g}"
+
     
 # ============================== begin logging ================================
 if master_process:
@@ -572,8 +624,8 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
-        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        # log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        # torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -617,6 +669,7 @@ for step in range(args.num_iterations + 1):
         print(
     f"step:{step+1}/{args.num_iterations} "
     f"{_format_lr(optimizer1, 'opt1_lr')} {_format_lr(optimizer2, 'opt2_lr')} "
+    f"{_format_sf_extra(optimizer2, 'opt2')}"
     f"train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms "
     f"step_avg:{approx_time/timed_steps:.2f}ms",
     flush=True)

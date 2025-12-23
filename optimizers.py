@@ -47,78 +47,256 @@ zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_new
 ## INCLUDE OTHER OPTIMIZERS FROM https://github.com/epfml/llm-optimizer-benchmark/blob/main/src/optim/
 
 
+# class Muon(torch.optim.Optimizer):
+#     """
+#     Muon - MomentUm Orthogonalized by Newton-schulz
+
+#     Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+#     processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+#     matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+#     the advantage that it can be stably run in bfloat16 on the GPU.
+
+#     Some warnings:
+#     - This optimizer assumes that all parameters passed in are 2D.
+#     - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+#     parameters; those should all be optimized by a standard method (e.g., AdamW).
+#     - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+#     - We believe it is unlikely to work well for training with small batch size.
+#     - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+#     - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+#     Arguments:
+#         lr: The learning rate used by the internal SGD.
+#         momentum: The momentum used by the internal SGD.
+#         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+#         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
+#         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
+#     """
+#     def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True,
+#                  backend='newtonschulz5', backend_steps=5,
+#                  rank=0, world_size=1):
+#         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+#         super().__init__(params, defaults)
+#         self.rank = rank
+#         self.world_size = world_size
+
+#     def step(self):
+
+#         for group in self.param_groups:
+
+#             lr = group['lr']
+#             momentum = group['momentum']
+#             zeropower_backend = zeropower_backends[group['backend']]
+
+#             # generate weight updates in distributed fashion
+#             total_params = sum(p.numel() for p in group['params'])
+#             updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+#             curr_idx = 0
+#             for i, p in enumerate(group['params']):
+#                 # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
+#                 if i % self.world_size == self.rank:
+#                     g = p.grad
+#                     if g is None:
+#                         continue
+#                     state = self.state[p]
+#                     if 'momentum_buffer' not in state:
+#                         state['momentum_buffer'] = torch.zeros_like(g)
+#                     buf = state['momentum_buffer']
+#                     buf.mul_(momentum).add_(g)
+#                     if group['nesterov']:
+#                         g = g.add(buf, alpha=momentum)
+#                     g = zeropower_backend(g, steps=group['backend_steps'])
+#                     g *= max(1, g.size(0)/g.size(1))**0.5
+#                     updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+#                 curr_idx += p.numel()
+
+#             # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+#             dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+#             # deserialize and apply updates
+#             curr_idx = 0
+#             for p in group['params']:
+#                 g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+#                 p.data.add_(g, alpha=-lr)
+#                 curr_idx += p.numel()
+
+
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
 
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
-    parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-    - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
-        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
+    Extra arguments:
+        log_stats: if True, track Frobenius norms per parameter for:
+            - weight
+            - raw gradient
+            - update before NS-5
+            - update after NS-5 (incl. Keller scaling)
+        param_name_map: optional dict: id(param) -> string name
+            (we will set this from nano_cli.py after building the optimizer)
     """
+    
     def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5,
-                 rank=0, world_size=1):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+                 backend='newtonschulz5', backend_steps=5, weight_decay: float = 0.1,
+                 rank=0, world_size=1,
+                 log_stats: bool = True,
+                 param_name_map: dict | None = None):
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            backend=backend,
+            backend_steps=backend_steps,
+        )
         super().__init__(params, defaults)
         self.rank = rank
         self.world_size = world_size
+        self.log_stats = log_stats
+        # filled from outside; can be None
+        self.param_name_map = param_name_map or {}
 
+        # populated every step() if log_stats is True and rank==0
+        self.last_step_global_stats = None   # aggregated means
+        self.last_step_layer_stats = None    # list of per-param dicts on this rank
+
+    @torch.no_grad()
     def step(self):
+        if self.log_stats:
+            grad_norm2 = 0.0
+            weight_norm2 = 0.0
+            pre_ns_norm2 = 0.0
+            post_ns_norm2 = 0.0
+            count = 0.0
+            per_layer_stats: list[dict] = []
+        else:
+            per_layer_stats = None
 
         for group in self.param_groups:
-
             lr = group['lr']
             momentum = group['momentum']
             zeropower_backend = zeropower_backends[group['backend']]
+            weight_decay = group.get('weight_decay', 0.0)
 
             # generate weight updates in distributed fashion
             total_params = sum(p.numel() for p in group['params'])
-            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+            updates_flat = torch.zeros(
+                total_params,
+                device='cuda',
+                dtype=torch.bfloat16,
+            )
+
             curr_idx = 0
             for i, p in enumerate(group['params']):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
+                # layer sharding by index
                 if i % self.world_size == self.rank:
-                    g = p.grad
-                    if g is None:
+                    g_raw = p.grad
+                    if g_raw is None:
+                        curr_idx += p.numel()
                         continue
+
                     state = self.state[p]
                     if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
+                        state['momentum_buffer'] = torch.zeros_like(g_raw)
                     buf = state['momentum_buffer']
-                    buf.mul_(momentum).add_(g)
+
+                    # momentum update
+                    buf.mul_(momentum).add_(g_raw)
+
                     if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                        # matches your original: g = g + momentum * buf
+                        g_pre = g_raw.add(buf, alpha=momentum)
+                    else:
+                        g_pre = buf
+
+                    if self.log_stats:
+                        w_f = p.data.detach().float()
+                        g_raw_f = g_raw.detach().float()
+                        g_pre_f = g_pre.detach().float()
+
+                        w_norm = w_f.norm(p='fro').item()
+                        grad_norm = g_raw_f.norm(p='fro').item()
+                        pre_ns_norm = g_pre_f.norm(p='fro').item()
+
+                        weight_norm2 += w_norm ** 2
+                        grad_norm2 += grad_norm ** 2
+                        pre_ns_norm2 += pre_ns_norm ** 2
+
+                    # NS-5 orthogonalization
+                    g_ns = zeropower_backend(g_pre, steps=group['backend_steps'])
+
+                    # Keller scaling (sqrt(max(1, m/n)))
+                    scale = max(1.0, g_ns.size(0) / g_ns.size(1)) ** 0.5
+                    g_ns = g_ns * scale
+
+                    if self.log_stats:
+                        g_ns_f = g_ns.detach().float()
+                        post_ns_norm = g_ns_f.norm(p='fro').item()
+                        post_ns_norm2 += post_ns_norm ** 2
+                        count += 1.0
+
+                        pname = self.param_name_map.get(id(p), None)
+                        per_layer_stats.append({
+                            "name": pname,
+                            "shape": tuple(p.shape),
+                            "weight_norm_F": w_norm,
+                            "grad_norm_F": grad_norm,
+                            "pre_ns_norm_F": pre_ns_norm,
+                            "post_ns_norm_F": post_ns_norm,
+                        })
+
+                    updates_flat[curr_idx:curr_idx + p.numel()] = g_ns.flatten().to(updates_flat.dtype)
+
                 curr_idx += p.numel()
 
-            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+            # sync updates across devices
             dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
             # deserialize and apply updates
             curr_idx = 0
             for p in group['params']:
-                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                g = updates_flat[curr_idx:curr_idx + p.numel()].view_as(p.data).type_as(p.data)
+                # AdamW-style decoupled weight decay on hidden matrices
+                if weight_decay != 0.0:
+                    # p <- p - lr * lambda * p
+                    p.data.add_(p.data, alpha=-lr * weight_decay)
+                    
                 p.data.add_(g, alpha=-lr)
                 curr_idx += p.numel()
+
+        if not self.log_stats:
+            return
+
+        if count == 0.0:
+            if self.rank == 0:
+                self.last_step_global_stats = None
+                self.last_step_layer_stats = []
+            return
+
+        local = torch.tensor(
+            [grad_norm2, weight_norm2, pre_ns_norm2, post_ns_norm2, count],
+            device='cuda',
+            dtype=torch.float32,
+        )
+        dist.all_reduce(local, op=dist.ReduceOp.SUM)
+
+        if self.rank == 0:
+            g2, w2, pre2, post2, cnt = local.tolist()
+            cnt = max(cnt, 1.0)
+
+            self.last_step_global_stats = {
+                "mean_grad_norm": float((g2 / cnt) ** 0.5),
+                "mean_weight_norm": float((w2 / cnt) ** 0.5),
+                "mean_pre_ns_norm": float((pre2 / cnt) ** 0.5),
+                "mean_post_ns_norm": float((post2 / cnt) ** 0.5),
+                "count": int(cnt),
+            }
+            # per-layer (this rank only). For world_size>1 you’ll see a subset of layers.
+            self.last_step_layer_stats = per_layer_stats
+        else:
+            self.last_step_global_stats = None
+            self.last_step_layer_stats = None
+
+
 
 # -----------------------------------------------------------------------------
 # Muon optimizer with iterate averaging 
@@ -136,7 +314,7 @@ class MuonIterAvg(torch.optim.Optimizer):  # [ia] renamed class from `Muon` -> `
 
     def __init__(self, params, lr = 3e-4, momentum = 0.95, nesterov = True,
                  backend = 'newtonschulz5', backend_steps = 5,
-                 ia_beta = 0.999,  # [ia] new arg with default 0.999
+                 ia_beta = 0.99,  # [ia] new arg with default 0.99
                  rank = 0, world_size = 1):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
                         backend=backend, backend_steps=backend_steps,
