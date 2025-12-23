@@ -52,14 +52,13 @@ This file assumes the following utilities are available (as in your original pro
 import os
 import sys
 import json
-import re
 import time
 import math
 import uuid
 import argparse
 import subprocess, textwrap
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import torch
@@ -71,11 +70,10 @@ from torch.optim.lr_scheduler import LambdaLR
 # Expect these to be present in the repo
 from data_loader import DistributedDataLoader
 from gpt2_model import GPT, GPTConfig
-from optimizers import Muon, MuonIterAvg
+from muon import Muon
+from normuon import NorMuon
 from adamw_schedulefree import AdamWScheduleFree
-from muon_schedulefree import MuonScheduleFree
 from normuon_schedulefree import NorMuonScheduleFree
-from asgo import asgo
 
 # ----------------------------------------------------------------------------
 # CLI & defaults
@@ -83,8 +81,11 @@ from asgo import asgo
 @dataclass
 class Hyperparameters:
     # data/model
-    input_bin : str = 'data/fineweb100B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb100B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    # USE THE CORRECT DIRECTORY WHERE DATA LIVES
+    # input_bin : str = 'data/fineweb100B/fineweb_train_*.bin' # input .bin to train on
+    # input_val_bin : str = 'data/fineweb100B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = '../nano-jlk/data/fineweb100B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = '../nano-jlk/data/fineweb100B/fineweb_val_*.bin' # input .bin to eval validation loss on
     model_type: str = "gpt2"
     vocab_size: int = 50304  # Modified to fit the GPU bette r
     # Parameters for GPT 2 Small 
@@ -143,6 +144,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--opt2-kwargs", type=str, default="")
 
     # evaluation & logging
+    p.add_argument("--save-pt", action="store_true", help="enable .pt checkpoint saving (default: off)")
     p.add_argument("--val-loss-every", type=int, default=Hyperparameters.val_loss_every)
     p.add_argument("--val-tokens", type=int, default=Hyperparameters.val_tokens)
     p.add_argument("--save-every", type=int, default=Hyperparameters.save_every)
@@ -204,10 +206,6 @@ def _safe_parse_kwargs(s: str) -> Dict[str, Any]:
 
 def _is_schedule_free_name(name: str) -> bool:
     return "schedulefree" in name.replace("_", "").replace("-", "").lower()
-
-
-def _is_schedule_free_opt(opt) -> bool:
-    return _is_schedule_free_name(opt.__class__.__name__)
 
 
 def _count_params(ps: Iterable[torch.Tensor]) -> int:
@@ -332,33 +330,37 @@ x, y = train_loader.next_batch()
 m = raw_model
 tied = (m.lm_head.weight is m.transformer.wte.weight)
 
+head_w  = m.lm_head.weight
+embed_w = m.transformer.wte.weight
+
 hidden_matrix_params = [
     p for n, p in m.named_parameters()
-    if p.ndim >= 2 and n != "lm_head.weight" and (tied or n != "transformer.wte.weight")
+    if p.ndim >= 2
+    and p is not head_w
+    and (tied or p is not embed_w)
 ]
-embed_params  = [] if tied else [m.transformer.wte.weight]
-scalar_params = [p for p in m.parameters() if p.ndim < 2]
-head_params   = [m.lm_head.weight]
 
-params_opt1 = scalar_params + head_params + embed_params
+scalar_params = [
+    p for n, p in m.named_parameters()
+    if p.ndim < 2
+]
+
+params_opt1 = scalar_params + [head_w] + ([] if tied else [embed_w])
 params_opt2 = hidden_matrix_params
 
+# safety check (cheap, keep it)
+assert set(map(id, params_opt1)).isdisjoint(map(id, params_opt2))
+
 if master_process:
-    def _count_params(ps): return sum(int(p.numel()) for p in ps)
+    def _count(ps): return sum(p.numel() for p in ps)
     print("=== PARAM GROUP SIZES ===", flush=True)
-    print(f"opt1_params (scalar+head+embed): {len(params_opt1)} tensors, {_count_params(params_opt1):,} params", flush=True)
-    print(f"opt2_params (hidden_mats):       {len(params_opt2)} tensors, {_count_params(params_opt2):,} params", flush=True)
+    print(f"opt1 (scalar+head+embed): {len(params_opt1)} tensors, {_count(params_opt1):,}", flush=True)
+    print(f"opt2 (hidden mats):      {len(params_opt2)} tensors, {_count(params_opt2):,}", flush=True)
     print("=========================", flush=True)
 
 # --- Optimizers ----------------------------------------------------------
 opt1_is_sf = _is_schedule_free_name(args.opt1)
 opt2_is_sf = _is_schedule_free_name(args.opt2)
-
-# Force schedule-free optimizers to have *no internal warmup*
-# if opt1_is_sf:
-#     opt1_kwargs.pop("warmup_steps", None)
-# if opt2_is_sf:
-#     opt2_kwargs.pop("warmup_steps", None)
 
 # Schedule-free optimizers should handle warmup internally.
 # If user didn't explicitly set warmup_steps in --opt*-kwargs, default to CLI --warmup-steps.
@@ -396,22 +398,10 @@ def make_linear_warmup_lambda(total_steps: int, warmup_steps: int):
     denom = float(warmup_steps)
     return lambda s: min(1.0, max(0.0, (min(s, warmup_steps - 1) + 1) / denom))
 
-def make_cosine_lambda(total_steps: int, r: float):
-    # cosine from 1.0 down to r over [0, total_steps)
-    T = max(1, int(total_steps))
-    return lambda s: r + 0.5 * (1 - r) * (1 + math.cos(math.pi * min(s, T - 1) / (T - 1)))
-
 schedulers: List[LambdaLR] = []
 
 warm = make_linear_warmup_lambda(args.num_iterations, args.warmup_steps)
 
-# def _final_lambda_for(opt, is_sf: bool):
-#     if is_sf or args.scheduler != "cosine":
-#         # Schedule-free (or no cosine): warmup only, then constant
-#         return warm
-#     # Non-SF + cosine: linear warmup → cosine
-#     r = _ratio_for_opt(opt)  # = min_lr / base_lr
-#     return make_cosine_with_warmup_lambda(args.num_iterations, args.warmup_steps, r)
 def _final_lambda_for(opt, is_sf: bool):
     if is_sf:
         # Schedule-free: NO external scheduling (optimizer handles warmup/constant internally).
@@ -520,10 +510,14 @@ def _format_sf_extra(opt: Optional[torch.optim.Optimizer], label: str) -> str:
 # ============================== begin logging ================================
 if master_process:
     run_id = str(uuid.uuid4())
-    logdir = f'logs/{run_id}/'
-    os.makedirs(logdir, exist_ok=True)
-    logfile = f'logs/{run_id}.txt'
+    logfile = f'logs/{run_id}.txt'      # flat file; no run directory
+    if args.save_pt:                    # only create a directory if saving .pt
+        logdir = f'logs/{run_id}/'
+        os.makedirs(logdir, exist_ok=True)
+    else:
+        logdir = None
 
+    
     print("=== SCHEDULER PLAN ===", flush=True)
     def _plan_line(tag: str, opt, is_sf: bool):
         if opt is None:
@@ -557,6 +551,7 @@ if master_process:
     code = _source_text()
 
     # Single, consolidated header write to logfile
+    os.makedirs("logs", exist_ok=True)
     with open(logfile, "w") as f:
         f.write("=" * 100 + "\n")
         f.write(_run_config_text() + "\n")
@@ -619,13 +614,13 @@ for step in range(args.num_iterations + 1):
         
         t0 = time.time()
 
-    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+    if master_process and args.save_pt and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
-        # log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-        # torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        log = dict(step=step, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
